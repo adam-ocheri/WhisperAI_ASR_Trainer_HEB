@@ -6,12 +6,14 @@ from transformers import WhisperFeatureExtractor, WhisperTokenizer, Seq2SeqTrain
 import evaluate
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
+import os
 
+hf_token = os.getenv("HF_TOKEN")
 
 def init():
     cache_dir = "./Model/"
     # model_name = "openai/whisper-large-v3"
-    model_name = "openai/whisper-small"
+    model_name = "openai/whisper-tiny"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("DEVICE: ", device)
 
@@ -28,10 +30,11 @@ def init():
     )
 
     tokenizer = WhisperTokenizer.from_pretrained(
-        model_name, cache_dir=cache_dir + model_name + "_tokenizer", task="transcribe"
+        model_name, cache_dir=cache_dir + model_name + "_tokenizer", language="Hebrew", task="transcribe"
     )
     
-
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
     print("Model loaded successfully! \n")
 
     
@@ -62,17 +65,17 @@ def init():
 
             return batch
 
-    common_voice = DatasetDict()
+    dataset = DatasetDict()
 
-    common_voice["train"] = load_dataset("mozilla-foundation/common_voice_11_0", "hi", split="train+validation", token=False)
-    common_voice["test"] = load_dataset("mozilla-foundation/common_voice_11_0", "hi", split="test", token=False)
+    dataset["train"] = load_dataset("imvladikon/hebrew_speech_kan", "default", split="train", token=False)
+    dataset["test"] = load_dataset("imvladikon/hebrew_speech_kan", "default", split="validation", token=False)
 
-    print(common_voice)
+    print("Printing Dataset: ")
+    print(dataset)
 
-    common_voice = common_voice.remove_columns(["accent", "age", "client_id", "down_votes", "gender", "locale", "path", "segment", "up_votes"])
+    # dataset = dataset.remove_columns(["accent", "age", "client_id", "down_votes", "gender", "locale", "path", "segment", "up_votes"])
 
-
-    input_str = common_voice["train"][0]["sentence"]
+    input_str = dataset["train"][0]["sentence"]
     labels = tokenizer(input_str).input_ids
     decoded_with_special = tokenizer.decode(labels, skip_special_tokens=False)
     decoded_str = tokenizer.decode(labels, skip_special_tokens=True)
@@ -82,8 +85,8 @@ def init():
     print(f"Decoded w/out special: {decoded_str}")
     print(f"Are equal:             {input_str == decoded_str}")
 
-    common_voice = common_voice.cast_column("audio", Audio(sampling_rate=16000))
-    print("common_voice['train'][0]", common_voice["train"][0])
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    print("dataset['train'][0]", dataset["train"][0])
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
     metric = evaluate.load("wer")
@@ -114,12 +117,13 @@ def init():
 
         return {"wer": wer}
 
-    common_voice = common_voice.map(prepare_dataset, remove_columns=common_voice.column_names["train"], num_proc=4)
-
+    dataset = dataset.map(prepare_dataset, remove_columns=dataset.column_names["train"], num_proc=4)
+    # train_batch_size = 16
+    # gradient_steps = 1
     training_args = Seq2SeqTrainingArguments(
-        output_dir="./whisper-small-hi",  # change to a repo name of your choice
+        output_dir="OverloadedOperator/tokomni-whisper",  
         per_device_train_batch_size=16,
-        gradient_accumulation_steps=1,  # increase by 2x for every 2x decrease in batch size
+        gradient_accumulation_steps=1,      # increase by 2x for every 2x decrease in batch size
         learning_rate=1e-5,
         warmup_steps=500,
         max_steps=4000,
@@ -136,14 +140,22 @@ def init():
         load_best_model_at_end=True,
         metric_for_best_model="wer",
         greater_is_better=False,
-        push_to_hub=False,
+        push_to_hub=True,
+    )
+
+    training_args = training_args.set_push_to_hub(
+        model_id="OverloadedOperator/tokomni-whisper", # Replace with your actual username and repo name
+        strategy="end", # Push the model at the end of training
+        token=hf_token, # Optional: Specify a token if you want to use a different one than the default
+        private_repo=False, # Optional: Set to True if you want the repo to be private
+        always_push=False, # Optional: Set to True to always push, even if the previous push is not finished
     )
 
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
-        train_dataset=common_voice["train"],
-        eval_dataset=common_voice["test"],
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["test"],
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         tokenizer=processor.feature_extractor,
@@ -151,6 +163,19 @@ def init():
 
     print("STARTING TRAINER...")
     trainer.train()
+
+    # Save Model - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+    kwargs = {
+        "dataset_tags": "imvladikon/hebrew_speech_kan",
+        "dataset": "KAN Hebrew Speech",  # a 'pretty' name for the training dataset
+        "dataset_args": "config: default, split: test",
+        "language": "he",
+        "model_name": "TK_Whisper_ASR",  # a 'pretty' name for your model
+        "finetuned_from": model_name,
+        "tasks": "automatic-speech-recognition",
+        "tags": "hf-asr-leaderboard",
+    }
+    trainer.push_to_hub(**kwargs)
 
 if __name__ == "__main__":
     init()
